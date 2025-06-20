@@ -43,4 +43,5 @@ htmlcov/
 *.tmp
 *.temp
 sample.pdf
+example.pdf
 .cursor/
