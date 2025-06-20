@@ -1,0 +1,15 @@
+[project]
+name = "dor"
+version = "0.1.0"
+description = "Document Q&A application using RAG (Retrieval Augmented Generation)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=0.3.25",
+    "langchain-community>=0.3.21",
+    "langchain-google-genai>=2.1.5",
+    "langchain-postgres>=0.0.14",
+    "langchain-text-splitters>=0.3.8",
+    "langgraph>=0.4.8",
+    "pypdf>=5.6.0",
+]
