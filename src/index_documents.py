@@ -7,6 +7,8 @@ import os
 import asyncio
 import logging
 from pathlib import Path
+import psycopg2
+from psycopg2.extras import execute_values
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -35,83 +37,95 @@ except Exception as e:
     logger.error(f"Failed to connect to vector store: {e}")
     raise
 
+def create_chunks_table(conn):
+    """
+    Create the 'chunks' table with the required schema if it does not exist.
+    Schema:
+        1. id – unique identifier (SERIAL PRIMARY KEY)
+        2. chunk_text – the text of the chunk
+        3. embedding – the embedding vector
+        4. filename – the original filename of the chunk
+        5. split_strategy – the chunk splitting method used
+        6. created_at – the timestamp when the row was inserted (default: NOW())
+    """
+    with conn.cursor() as cur:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS chunks (
+                id SERIAL PRIMARY KEY, -- Unique identifier for each chunk
+                chunk_text TEXT NOT NULL, -- The text of the chunk
+                embedding VECTOR, -- The embedding vector (use appropriate type for your PGVector extension)
+                filename TEXT NOT NULL, -- The original filename of the chunk
+                split_strategy TEXT NOT NULL, -- The chunk splitting method used
+                created_at TIMESTAMP NOT NULL DEFAULT NOW() -- Timestamp when the row was inserted
+            )
+        ''')
+        conn.commit()
+
+
+def insert_chunks(conn, chunks, embeddings, filename, split_strategy):
+    """
+    Insert document chunks and their embeddings into the 'chunks' table.
+    Each row will have all required fields populated.
+    Args:
+        conn: psycopg2 connection
+        chunks: List of chunk texts
+        embeddings: List of embedding vectors
+        filename: The source filename for all chunks
+        split_strategy: The splitting method used
+    """
+    values = [
+        (chunk, embedding, filename, split_strategy)
+        for chunk, embedding in zip(chunks, embeddings)
+    ]
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            '''
+            INSERT INTO chunks (chunk_text, embedding, filename, split_strategy)
+            VALUES %s
+            ''',
+            values
+        )
+        conn.commit()
 
 async def index_documents() -> None:
     """
     Index all PDF documents in the workspace root directory.
+    Ensures the 'chunks' table exists and inserts all required fields for each chunk.
     """
     try:
         logger.info("Starting document indexing process...")
-        
-        # Find all PDF files in the workspace root
         workspace_root = Path(".")
         pdf_files = list(workspace_root.glob("*.pdf"))
-        
         if not pdf_files:
             logger.warning("No PDF files found in workspace root")
             return
-        
         logger.info(f"Found {len(pdf_files)} PDF files to index")
-        
-        # Process each PDF file
+        # Connect to PostgreSQL
+        # psycopg2 does not support the '+psycopg' dialect in the connection string, so we remove it.
+        conn_str = POSTGRES_URL.replace("+psycopg", "")
+        conn = psycopg2.connect(conn_str)
+        create_chunks_table(conn)  # Ensure table exists
         all_documents = []
-        text_splitter = CharacterTextSplitter(
-            separator="\n\n",
-        )
-        
+        text_splitter = CharacterTextSplitter(separator="\n\n")
+        split_strategy = "character"  # Or any other strategy you use
         for pdf_file in pdf_files:
             try:
                 logger.info(f"Processing: {pdf_file.name}")
-                
-                # Load the PDF
                 loader = PyPDFLoader(str(pdf_file))
                 documents = loader.load()
-                
-                # Split the documents into chunks
                 splits = text_splitter.split_documents(documents)
-                
-                # Add metadata about the source file
-                for split in splits:
-                    split.metadata["source_file"] = pdf_file.name
-                all_documents.extend(splits)
-                logger.info(f"Split {pdf_file.name} into {len(splits)} chunks")
-                
+                chunks = [split.page_content for split in splits]
+                # Get embeddings for all chunks
+                embeddings_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", api_key=GOOGLE_API_KEY)
+                embeddings = [embeddings_model.embed_query(chunk) for chunk in chunks]
+                insert_chunks(conn, chunks, embeddings, pdf_file.name, split_strategy)
+                logger.info(f"Inserted {len(chunks)} chunks from {pdf_file.name} into the database.")
             except Exception as e:
                 logger.error(f"Error processing {pdf_file.name}: {e}")
                 continue
-        
-        if not all_documents:
-            logger.warning("No documents were successfully processed")
-            return
-        
-        # Check if documents are already indexed (simple check)
-        try:
-            # Try a simple similarity search to see if vector store has content
-            test_results = vector_store.similarity_search("test query", k=1)
-            if test_results:
-                logger.info(f"Vector store already contains documents. Found {len(test_results)} existing documents.")
-                # Optionally, you might want to skip re-indexing or clear and re-index
-                # For now, we'll add new documents anyway
-        except Exception:
-            logger.info("Vector store appears to be empty, proceeding with indexing")
-        
-        # Add documents to vector store in batches
-        batch_size = 10
-        total_batches = (len(all_documents) + batch_size - 1) // batch_size
-        
-        for i in range(0, len(all_documents), batch_size):
-            batch = all_documents[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            
-            try:
-                vector_store.add_documents(batch)
-                logger.info(f"Added batch {batch_num}/{total_batches} ({len(batch)} documents)")
-            except Exception as e:
-                logger.error(f"Error adding batch {batch_num}: {e}")
-                continue
-        
-        logger.info(f"Successfully indexed {len(all_documents)} document chunks from {len(pdf_files)} PDF files")
-        
+        conn.close()
+        logger.info(f"Successfully indexed document chunks from {len(pdf_files)} PDF files")
     except Exception as e:
         logger.error(f"Error during document indexing: {e}")
         raise

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import os
 import logging
 import asyncio
+import psycopg2
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -46,15 +47,14 @@ Instructions:
     input_variables=["retrieved_context", "user_query"],
 )
 
+# Replace PGVector with a direct database connection
 try:
-    vector_store = PGVector(
-        connection=POSTGRES_URL,
-        embeddings=embeddings,
-        collection_name="documents",
-    )
-    logger.info("Successfully connected to vector store")
+    # psycopg2 does not support the '+psycopg' dialect in the connection string, so we remove it.
+    conn_str = POSTGRES_URL.replace("+psycopg", "")
+    db_conn = psycopg2.connect(conn_str)
+    logger.info("Successfully connected to the database")
 except Exception as e:
-    logger.error(f"Failed to connect to vector store: {e}")
+    logger.error(f"Failed to connect to database: {e}")
     raise
 
 # Define state for application - Updated to include messages for chat interface compatibility
@@ -79,14 +79,29 @@ def extract_question(state: State) -> dict:
 
 
 def retrieve(state: State) -> dict:
-    """Retrieve relevant documents based on the question."""
+    """Retrieve relevant documents from the 'chunks' table based on the question."""
     question = state.get("question", "")
     if not question:
         logger.warning("No question found for retrieval")
         return {"context": []}
     
     try:
-        retrieved_docs = vector_store.similarity_search(question, k=5)
+        # Get the embedding for the user's question
+        question_embedding = embeddings.embed_query(question)
+        
+        # Query the database for the most similar chunks using cosine distance
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT chunk_text, filename FROM chunks ORDER BY embedding <=> %s LIMIT 5",
+                (str(question_embedding),)
+            )
+            results = cur.fetchall()
+            
+        # Convert results to LangChain Document objects
+        retrieved_docs = [
+            Document(page_content=row[0], metadata={"source": row[1]}) for row in results
+        ]
+
         logger.info(f"Retrieved {len(retrieved_docs)} documents for question: {question[:50]}...")
         return {"context": retrieved_docs}
     except Exception as e:
@@ -244,15 +259,18 @@ def main() -> None:
     """
     Main entry point for the chat interface.
     
-    Checks if the vector store has documents and starts the chat interface.
+    Checks if the 'chunks' table has documents and starts the chat interface.
     """
     try:
-        # Test if the vector store has any documents
-        test_results = vector_store.similarity_search("test", k=1)
+        # Test if the 'chunks' table has any documents
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM chunks LIMIT 1")
+            test_results = cur.fetchone()
+
         if not test_results:
-            print("\n⚠️  Warning: No documents found in the vector store.")
+            print("\n⚠️  Warning: No documents found in the 'chunks' table.")
             print("Please run the indexing script first to add documents:")
-            print("python src/index_documents.py")
+            print("uv run src/index_documents.py")
             return
             
         # Start the chat interface
@@ -262,6 +280,10 @@ def main() -> None:
         logger.error(f"Error starting chat interface: {e}")
         print(f"\n❌ Error: {e}")
         print("Make sure your database is running and documents are indexed.")
+    finally:
+        if 'db_conn' in locals() and db_conn:
+            db_conn.close()
+            logger.info("Database connection closed.")
 
 
 if __name__ == "__main__":
